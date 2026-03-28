@@ -84,6 +84,20 @@ body::after {
   letter-spacing: .06em;
   margin-top: 3px;
 }
+.mute-btn {
+  margin-top: 10px;
+  padding: 4px 14px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text3);
+  font-family: 'Cinzel', serif;
+  font-size: .6rem;
+  letter-spacing: .12em;
+  cursor: pointer;
+  transition: all .2s;
+}
+.mute-btn:hover { border-color: var(--gold-dim); color: var(--gold); }
+.mute-btn.muted { color: var(--text3); border-color: var(--border2); opacity: .5; }
 
 /* ── xp strip ── */
 .xp-strip {
@@ -536,6 +550,7 @@ body::after {
 <div class="hdr">
   <div class="hdr-title">⚔ ORDBOK ⚔</div>
   <div class="hdr-sub">WoW Classic &amp; TBC · Norsk Treningsleir</div>
+  <button class="mute-btn" id="muteBtn" onclick="toggleBGM()" title="Toggle music">♪ BGM ON</button>
 </div>
 
 <!-- XP STRIP -->
@@ -1320,7 +1335,157 @@ const AC = (()=>{
     });
   }
 
-  return { correct, wrong, tick, skip, fanfare, levelUp };
+  return { correct, wrong, tick, skip, fanfare, levelUp, getCtx };
+})();
+
+// ═══════════════════════════════════════════════════════
+//  BGM ENGINE — ambient pentatonic loop, no files needed
+// ═══════════════════════════════════════════════════════
+const BGM = (()=>{
+  let ctx = null, masterGain = null, running = false, muted = false;
+  let droneNodes = [], melodyTimeout = null, arpTimeout = null;
+
+  function init(){
+    ctx = AC.getCtx();
+    masterGain = ctx.createGain();
+    masterGain.gain.setValueAtTime(0.0, ctx.currentTime);
+    masterGain.connect(ctx.destination);
+  }
+
+  // Soft pad/drone — layered detuned sines for warmth
+  function startDrone(){
+    // Root: D2 (73.4 Hz), fifth: A2 (110 Hz)
+    [[73.4, 0], [73.4, 4], [110.0, 0], [110.0, -3], [146.8, 2]].forEach(([freq, detune])=>{
+      const osc = ctx.createOscillator();
+      const g   = ctx.createGain();
+      const flt = ctx.createBiquadFilter();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      osc.detune.value    = detune;
+      flt.type = 'lowpass'; flt.frequency.value = 400;
+      g.gain.value = 0.055;
+      osc.connect(flt); flt.connect(g); g.connect(masterGain);
+      osc.start();
+      droneNodes.push(osc, g);
+    });
+  }
+
+  function stopDrone(){
+    droneNodes.forEach(n=>{ try{ n.disconnect(); if(n.stop) n.stop(); }catch(e){} });
+    droneNodes = [];
+  }
+
+  // Pentatonic scale in D minor: D3 F3 G3 A3 C4 D4 F4 G4 A4
+  const PENTA = [146.8, 174.6, 196.0, 220.0, 261.6, 293.7, 349.2, 392.0, 440.0];
+
+  function softNote(freq, startT, dur, gain=0.045){
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+    const flt = ctx.createBiquadFilter();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    flt.type = 'lowpass'; flt.frequency.value = 1800;
+    env.gain.setValueAtTime(0, startT);
+    env.gain.linearRampToValueAtTime(gain, startT + 0.08);
+    env.gain.setValueAtTime(gain, startT + dur - 0.25);
+    env.gain.linearRampToValueAtTime(0, startT + dur);
+    osc.connect(flt); flt.connect(env); env.connect(masterGain);
+    osc.start(startT); osc.stop(startT + dur + 0.05);
+  }
+
+  // Slow wandering melody — picks notes from upper penta range
+  const MELODY_UPPER = [220.0, 261.6, 293.7, 349.2, 392.0, 440.0, 523.3];
+  // Melodic phrase patterns (intervals into MELODY_UPPER)
+  const PHRASES = [
+    [4,5,6,5,4,3,4],
+    [3,4,5,4,3,2,3],
+    [5,6,5,4,5,4,3],
+    [2,3,4,5,4,3,2],
+    [4,3,2,3,4,5,4],
+  ];
+
+  function scheduleMelody(){
+    if(!running) return;
+    const phrase = PHRASES[Math.floor(Math.random()*PHRASES.length)];
+    const t = ctx.currentTime + 0.1;
+    const noteDur = 1.8 + Math.random()*0.8;   // each note ~1.8–2.6s
+    const gap     = 0.3 + Math.random()*0.4;    // gap between notes
+    let offset = 0;
+    phrase.forEach((idx, i)=>{
+      const freq = MELODY_UPPER[Math.min(idx, MELODY_UPPER.length-1)];
+      // slight gain variation for expression
+      const g = 0.038 + Math.random()*0.014;
+      softNote(freq, t + offset, noteDur, g);
+      offset += noteDur - 0.6 + gap;
+    });
+    // total phrase duration + rest before next
+    const totalDur = (offset + 2.5) * 1000;
+    melodyTimeout = setTimeout(scheduleMelody, totalDur);
+  }
+
+  // Gentle arpeggio — D minor chord tones, high register, very soft
+  const ARP_NOTES = [293.7, 349.2, 440.0, 587.3, 698.5];
+  function scheduleArp(){
+    if(!running) return;
+    const t = ctx.currentTime + 0.05;
+    const pattern = [0,1,2,3,2,1,0,1,2,3,4,3,2,1];
+    const step = 0.38 + Math.random()*0.12;
+    pattern.forEach((idx,i)=>{
+      softNote(ARP_NOTES[idx], t + i*step, 1.1, 0.018);
+    });
+    const loopMs = (pattern.length * step + 3.5) * 1000;
+    arpTimeout = setTimeout(scheduleArp, loopMs);
+  }
+
+  function fadeIn(){
+    if(!masterGain) return;
+    const t = ctx.currentTime;
+    masterGain.gain.cancelScheduledValues(t);
+    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+    masterGain.gain.linearRampToValueAtTime(1.0, t + 3.0);
+  }
+
+  function fadeOut(cb){
+    if(!masterGain) return;
+    const t = ctx.currentTime;
+    masterGain.gain.cancelScheduledValues(t);
+    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+    masterGain.gain.linearRampToValueAtTime(0.0, t + 2.0);
+    if(cb) setTimeout(cb, 2200);
+  }
+
+  function start(){
+    if(running) return;
+    if(!ctx) init();
+    running = true;
+    startDrone();
+    scheduleMelody();
+    setTimeout(scheduleArp, 4000); // arp starts after melody establishes
+    fadeIn();
+  }
+
+  function stop(){
+    running = false;
+    clearTimeout(melodyTimeout);
+    clearTimeout(arpTimeout);
+    fadeOut(()=> stopDrone());
+  }
+
+  function toggleMute(){
+    muted = !muted;
+    if(!ctx) init();
+    if(muted){
+      fadeOut();
+    } else {
+      if(!running) start();
+      else fadeIn();
+    }
+    return muted;
+  }
+
+  function isRunning(){ return running; }
+
+  return { start, stop, toggleMute, isRunning };
 })();
 
 // ═══════════════════════════════════════════════════════
@@ -1375,6 +1540,7 @@ function launchQuickClasses(){
   S.selectedClasses = [...quickClassSel];
   S.selectedDepths = ['weapons','armor','playstyle'];
   buildDeck();
+  BGM.start();
   showScreen('sQuiz');
   loadCard();
 }
@@ -1434,6 +1600,7 @@ function launch(){
   }
   if(S.selectedDepths.length===0) S.selectedDepths=['weapons','armor','playstyle'];
   buildDeck();
+  BGM.start();
   showScreen('sQuiz');
   loadCard();
 }
@@ -1678,6 +1845,13 @@ function mkBtn(icon,name,sub,cb,cls){
   b.onclick=cb;
   return b;
 }
+function toggleBGM(){
+  const muted = BGM.toggleMute();
+  const btn = document.getElementById('muteBtn');
+  btn.textContent = muted ? '♪ BGM OFF' : '♪ BGM ON';
+  btn.classList.toggle('muted', muted);
+}
+
 function capFirst(s){ return s.charAt(0).toUpperCase()+s.slice(1); }
 
 const corrects=['Riktig!','Perfekt!','Bra jobbet!','Excellent!','Ja!'];
